@@ -415,7 +415,7 @@ static rlm_rcode_t do_python(rlm_python_t *inst, REQUEST *request, PyObject *pFu
 			 *	PyEval_AcquireThread for swapping in the new thread state.
 			 */
 			PyEval_AcquireLock();
-			my_thread_state = PyThreadState_New(inst->main_thread_state->interp);
+			my_thread_state = PyThreadState_New(PyThreadState_Swap(NULL)->interp);
 			if (!my_thread_state) {
 				REDEBUG("Failed initialising local PyThreadState on first run");
 				PyEval_ReleaseLock();
