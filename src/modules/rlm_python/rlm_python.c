@@ -31,9 +31,13 @@ RCSID("$Id$")
 
 #include <Python.h>
 
+#ifdef HAVE_PTHREAD_H
 #define Pyx_BLOCK_THREADS    {PyGILState_STATE __gstate = PyGILState_Ensure();
 #define Pyx_UNBLOCK_THREADS   PyGILState_Release(__gstate);}
-
+#else
+#define Pyx_BLOCK_THREADS
+#define Pyx_UNBLOCK_THREADS
+#endif
 /*
  *	TODO: The only needed thing here is function. Anything else is
  *	required for initialization only. I will remove it, putting a
@@ -48,6 +52,7 @@ struct py_function_def {
 };
 
 typedef struct rlm_python_t {
+	PyThreadState *main_thread_state;
 	struct py_function_def
 	instantiate,
 		authorize,
@@ -127,6 +132,11 @@ static struct {
 	{ NULL, 0 },
 };
 
+/*
+ *	This allows us to initialise PyThreadState on a per thread basis
+ */
+fr_thread_local_init(PyThreadState *, local_thread_state);	/* macro */
+
 
 /*
  *	Let assume that radiusd module is only one since we have only
@@ -195,7 +205,7 @@ failed:
 	Pyx_UNBLOCK_THREADS
 		}
 
-static int mod_init(void)
+static int mod_init(rlm_python_t *inst)
 {
 	int i;
 	static char name[] = "radiusd";
@@ -204,8 +214,10 @@ static int mod_init(void)
 	
 	Py_SetProgramName(name);
 	Py_Initialize();
+#ifdef HAVE_PTHREAD_H
 	PyEval_InitThreads(); /* This also grabs a lock */
-	
+	inst->main_thread_state = PyThreadState_Get();	/* We need this for setting up thread local stuff */
+#endif	
 	if ((radiusd_module = Py_InitModule3("radiusd", radiusd_methods,
 					     "FreeRADIUS Module.")) == NULL)
 		goto failed;
@@ -216,9 +228,10 @@ static int mod_init(void)
 			goto failed;
 		}
 	}
-	
+
+#ifdef HAVE_PTHREAD_H
 	PyEval_ReleaseLock(); /* Drop lock grabbed by InitThreads */
-	
+#endif	
 	DEBUG("mod_init done");
 	return 0;
 	
@@ -235,10 +248,11 @@ failed:
 static int mod_destroy(void)
 {
 	Pyx_BLOCK_THREADS
-		Py_XDECREF(radiusd_module);
+	Py_XDECREF(radiusd_module);
 	Py_Finalize();
 	Pyx_UNBLOCK_THREADS
-		return 0;
+	
+	return 0;
 }
 
 /*
@@ -354,7 +368,29 @@ failed:
 	return -1;
 }
 
-static rlm_rcode_t do_python(REQUEST *request, PyObject *pFunc, char const *funcname)
+#ifdef HAVE_PTHREAD_H
+/** Cleanup any thread local storage on pthread_exit()
+ *
+ * Callback for pthread_cleanup_push
+ */
+static void do_python_cleanup(UNUSED void *arg)
+{
+	PyThreadState	*my_thread_state;
+	
+	my_thread_state = fr_thread_local_get(local_thread_state);
+	if (!my_thread_state) {
+		return;
+	}
+	
+	PyEval_AcquireLock();
+	PyThreadState_Swap(NULL);	/* Not entirely sure this is needed */
+	PyThreadState_Clear(my_thread_state);
+	PyThreadState_Delete(my_thread_state);
+	PyEval_ReleaseLock();
+}
+#endif
+
+static rlm_rcode_t do_python(rlm_python_t *inst, REQUEST *request, PyObject *pFunc, char const *funcname)
 {
 	vp_cursor_t	cursor;
 	VALUE_PAIR      *vp;
@@ -362,13 +398,60 @@ static rlm_rcode_t do_python(REQUEST *request, PyObject *pFunc, char const *func
 	PyObject	*pArgs = NULL;
 	int		tuplelen;
 	int		ret;
-	
-	PyGILState_STATE gstate;
-	
+
 	/* Return with "OK, continue" if the function is not defined. */
 	if (!pFunc)
 		return RLM_MODULE_OK;
 	
+#ifdef HAVE_PTHREAD_H
+	{
+		PyThreadState *my_thread_state = fr_thread_local_get(local_thread_state);
+		if (!my_thread_state) {
+			pthread_key_t tls_destructor;
+			
+			/*
+			 *	The double lock/release may be inefficient, but we should
+			 *	only have to do it once, and the manual recommends calling
+			 *	PyEval_AcquireThread for swapping in the new thread state.
+			 */
+			PyEval_AcquireLock();
+			my_thread_state = PyThreadState_New(inst->main_thread_state->interp);
+			if (!my_thread_state) {
+				REDEBUG("Failed initialising local PyThreadState on first run");
+				PyEval_ReleaseLock();
+				return RLM_MODULE_FAIL;
+			}
+			
+			ret = fr_thread_local_set(local_thread_state, my_thread_state);
+			if (ret != 0) {
+				REDEBUG("Failed storing PyThreadState in TLS: %s", strerror(ret));
+			
+				goto tls_fail;
+			}
+			
+			/*
+			 *	This should ensure do_python_cleanup gets called when the
+			 *	thread exits.
+			 */
+			ret = pthread_key_create(&tls_destructor, do_python_cleanup);
+			if (ret != 0) {
+				REDEBUG("Failed setting PyThreadState destructor: %s", strerror(ret));
+				
+				tls_fail:
+				PyThreadState_Clear(my_thread_state);
+				PyThreadState_Delete(my_thread_state);
+				PyEval_ReleaseLock();
+	
+				return RLM_MODULE_FAIL;
+			}
+
+			PyEval_ReleaseLock();
+		}
+		PyEval_AcquireThread(my_thread_state);	/* Swap in our local thread state */
+	}
+#endif
+	
+
 	/* Default return value is "OK, continue" */
 	ret = RLM_MODULE_OK;
 	
@@ -388,8 +471,6 @@ static rlm_rcode_t do_python(REQUEST *request, PyObject *pFunc, char const *func
 			tuplelen++;
 		}
 	}
-
-	gstate = PyGILState_Ensure();
 	
 	if (tuplelen == 0) {
 		Py_INCREF(Py_None);
@@ -479,15 +560,18 @@ static rlm_rcode_t do_python(REQUEST *request, PyObject *pFunc, char const *func
 okay:
 	Py_DECREF(pArgs);
 	Py_DECREF(pRet);
-	PyGILState_Release(gstate);
+#ifdef HAVE_PTHREAD_H
+	PyEval_SaveThread();
+#endif
 	return ret;
 	
 failed:
 	mod_error();
 	Py_XDECREF(pArgs);
 	Py_XDECREF(pRet);
-	PyGILState_Release(gstate);
-	
+#ifdef HAVE_PTHREAD_H
+	PyEval_SaveThread();
+#endif
 	return RLM_MODULE_FAIL;
 }
 
@@ -589,7 +673,7 @@ static int mod_instantiate(UNUSED CONF_SECTION *conf, void *instance)
 {
 	rlm_python_t *inst = instance;
 
-	if (mod_init() != 0) {
+	if (mod_init(inst) != 0) {
 		return -1;
 	}
 
@@ -616,7 +700,7 @@ static int mod_instantiate(UNUSED CONF_SECTION *conf, void *instance)
 	 *	Call the instantiate function.  No request.  Use the
 	 *	return value.
 	 */
-	return do_python(NULL, inst->instantiate.function,
+	return do_python(inst, NULL, inst->instantiate.function,
 			 "instantiate");
 failed:
 	mod_error();
@@ -629,14 +713,14 @@ static int mod_detach(void *instance)
 	rlm_python_t *inst = instance;
 	int	     ret;
 	
-	ret = do_python(NULL, inst->detach.function, "detach");
+	ret = do_python(inst, NULL, inst->detach.function, "detach");
 	
 	mod_instance_clear(inst);
 	return ret;
 }
 
 #define A(x) static rlm_rcode_t mod_##x(void *instance, REQUEST *request) { \
-		return do_python(request, ((rlm_python_t *)instance)->x.function, #x); \
+		return do_python((rlm_python_t *) instance, request, ((rlm_python_t *)instance)->x.function, #x); \
 	}
 
 A(authenticate)
